@@ -72,7 +72,9 @@ func main() {
 	srv := &http.Server{
 		Addr: *addr,
 		Handler: &handler{
-			proxy: proxy,
+			proxy:   proxy,
+			logger:  logger,
+			verbose: *verbose,
 			opts: hlsflv.Options{
 				UserAgent:      *ua,
 				Referer:        *referer,
@@ -217,6 +219,10 @@ type handler struct {
 	opts hlsflv.Options
 	// proxy forwards requests that are not FLV requests. Nil disables it.
 	proxy *httputil.ReverseProxy
+	// logger receives one line per proxied request. Nil disables the log.
+	logger *log.Logger
+	// verbose adds the query string to proxied request log lines.
+	verbose bool
 }
 
 // flvPath is the endpoint that converts an HLS playlist to FLV. It is only a
@@ -224,16 +230,44 @@ type handler struct {
 // and a proxied request for the same path are not mistaken for one another.
 const flvPath = "/index.flv"
 
-// urlQueryKeys are the query parameter names accepted as the upstream playlist
-// URL. The first one that is present wins.
-var urlQueryKeys = []string{"url", "u", "src"}
+// Query parameter names understood on flvPath.
+const (
+	// urlQueryKey names the upstream playlist URL.
+	urlQueryKey = "url"
+	// uaQueryKey and refererQueryKey are the common per request header
+	// overrides, listed separately because they are what hotlink protection
+	// usually keys on.
+	uaQueryKey      = "ua"
+	refererQueryKey = "referer"
+	originQueryKey  = "origin"
+	// headerQueryKey carries any further header as "Name: Value" and may be
+	// repeated. Only names on the allow list are accepted.
+	headerQueryKey = "header"
+)
+
+// urlQueryKeys are the parameter names accepted as the upstream playlist URL.
+// The first one that is present wins.
+var urlQueryKeys = []string{urlQueryKey, "u", "src"}
+
+// flvRequest is a parsed FLV conversion request.
+type flvRequest struct {
+	target  string
+	headers []hlsflv.RequestHeader
+}
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Only an FLV request is handled here. Everything else, including a
 	// proxied request whose own query string happens to contain "url", is
 	// forwarded untouched.
-	if target, ok := flvTarget(r); ok {
-		h.serveFLV(w, r, target)
+	req, isFLV, err := parseFLVRequest(r)
+	if err != nil {
+		// The request was aimed at the FLV endpoint but is malformed, so say so
+		// rather than silently proxying it to the API upstream.
+		http.Error(w, err.Error()+"\n\n"+usageText(), http.StatusBadRequest)
+		return
+	}
+	if isFLV {
+		h.serveFLV(w, r, req)
 		return
 	}
 	// A browser opening the endpoint directly gets help rather than a proxied
@@ -246,26 +280,89 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveProxy(w, r)
 }
 
-// flvTarget reports whether the request asks for an FLV conversion and returns
-// the upstream playlist URL. The path must match exactly, so a proxied request
-// for another endpoint cannot be captured just because it has a url parameter.
-func flvTarget(r *http.Request) (string, bool) {
+// parseFLVRequest reports whether the request asks for an FLV conversion and
+// returns the parsed target and headers.
+//
+// The path must match exactly, so a proxied request for another endpoint cannot
+// be captured just because it has a url parameter.
+func parseFLVRequest(r *http.Request) (flvRequest, bool, error) {
 	if r.URL.Path != flvPath {
-		return "", false
+		return flvRequest{}, false, nil
 	}
 	q := r.URL.Query()
+
+	raw := ""
 	for _, key := range urlQueryKeys {
-		v := strings.TrimSpace(q.Get(key))
-		if v == "" {
-			continue
+		if v := strings.TrimSpace(q.Get(key)); v != "" {
+			raw = v
+			break
 		}
-		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return v, false
-		}
-		return u.String(), true
 	}
-	return "", false
+	if raw == "" {
+		return flvRequest{}, false, nil
+	}
+	target, err := parsePlaylistURL(raw)
+	if err != nil {
+		return flvRequest{}, false, err
+	}
+
+	headers, err := requestHeaders(q)
+	if err != nil {
+		return flvRequest{}, false, err
+	}
+	return flvRequest{target: target, headers: headers}, true, nil
+}
+
+// parsePlaylistURL validates the upstream playlist URL.
+func parsePlaylistURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("malformed playlist URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("unsupported scheme %q: the playlist URL must be http or https", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", errors.New("the playlist URL has no host")
+	}
+	return u.String(), nil
+}
+
+// requestHeaders collects the header overrides from the query string.
+//
+// A parameter that is absent leaves the default header alone, while a parameter
+// that is present but empty clears it, so a caller can suppress the default
+// Referer on purpose.
+func requestHeaders(q url.Values) ([]hlsflv.RequestHeader, error) {
+	var out []hlsflv.RequestHeader
+
+	// addOverride records a header only when the parameter was actually given.
+	addOverride := func(param, name string) {
+		values, present := q[param]
+		if !present {
+			return
+		}
+		value := ""
+		if len(values) > 0 {
+			value = strings.TrimSpace(values[0])
+		}
+		h, err := hlsflv.NewRequestHeader(name, value)
+		if err == nil {
+			out = append(out, h)
+		}
+	}
+	addOverride(uaQueryKey, "User-Agent")
+	addOverride(refererQueryKey, "Referer")
+	addOverride(originQueryKey, "Origin")
+
+	for _, spec := range q[headerQueryKey] {
+		h, err := hlsflv.ParseRequestHeader(spec)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, nil
 }
 
 // serveProxy forwards a request unchanged to the configured upstream.
@@ -274,10 +371,61 @@ func (h *handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	h.proxy.ServeHTTP(w, r)
+	if h.logger == nil {
+		h.proxy.ServeHTTP(w, r)
+		return
+	}
+
+	// Wrap the writer so the log line can report what the upstream answered.
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	start := time.Now()
+	h.proxy.ServeHTTP(rec, r)
+
+	target := r.URL.Path
+	if h.verbose {
+		// The query string can carry tokens and signatures, so it is only
+		// logged when explicitly asked for.
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+	}
+	h.logger.Printf("proxy %s %s -> %d (%d bytes, %s)",
+		r.Method, target, rec.status, rec.written, time.Since(start).Round(time.Millisecond))
 }
 
-func (h *handler) serveFLV(w http.ResponseWriter, r *http.Request, target string) {
+// statusRecorder remembers the status code and body size written by the proxy.
+type statusRecorder struct {
+	http.ResponseWriter
+	status  int
+	written int64
+	wrote   bool
+}
+
+func (s *statusRecorder) WriteHeader(status int) {
+	if !s.wrote {
+		s.status = status
+		s.wrote = true
+	}
+	s.ResponseWriter.WriteHeader(status)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wrote {
+		s.wrote = true
+	}
+	n, err := s.ResponseWriter.Write(b)
+	s.written += int64(n)
+	return n, err
+}
+
+// Flush keeps streaming responses working through the wrapper.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (h *handler) serveFLV(w http.ResponseWriter, r *http.Request, req flvRequest) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -300,13 +448,14 @@ func (h *handler) serveFLV(w http.ResponseWriter, r *http.Request, target string
 	}
 
 	opts := h.opts
+	opts.PerRequestHeader = req.headers
 	if opts.Logger == nil {
 		opts.Logger = func(string, ...any) {}
 	}
 
 	// hlsflv writes through a flushWriter so every segment reaches the client
 	// immediately instead of waiting in net/http's output buffer.
-	client, err := hlsflv.New(target, &flushWriter{w: w, f: flusher}, opts)
+	client, err := hlsflv.New(req.target, &flushWriter{w: w, f: flusher}, opts)
 	if err != nil {
 		// The response has already started; report on stderr and stop.
 		opts.Logger("blrechelper: %v", err)
@@ -317,7 +466,7 @@ func (h *handler) serveFLV(w http.ResponseWriter, r *http.Request, target string
 	err = client.Run(r.Context())
 	stats := client.Stats()
 	opts.Logger("blrechelper: finished %s after %s: %d segments, %d tags, %.1f MiB (%v)",
-		target, time.Since(start).Round(time.Millisecond), stats.Segments, stats.Samples,
+		req.target, time.Since(start).Round(time.Millisecond), stats.Segments, stats.Samples,
 		float64(stats.Bytes)/(1<<20), err)
 }
 

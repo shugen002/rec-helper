@@ -34,6 +34,61 @@ const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 // client connects, so a late joiner is not forced through minutes of backlog.
 const maxMirroredLiveSegments = 6
 
+// allowedRequestHeaders lists the header names a caller may set per request.
+//
+// It is an allow list rather than a deny list because a passthrough header
+// mechanism is otherwise an open relay for arbitrary header injection. The
+// names here are the ones origins actually key on for hotlink protection, plus
+// the credentials a private stream needs.
+var allowedRequestHeaders = map[string]string{
+	"user-agent":      "User-Agent",
+	"referer":         "Referer",
+	"referrer":        "Referer", // common misspelling, accepted for convenience
+	"origin":          "Origin",
+	"authorization":   "Authorization",
+	"cookie":          "Cookie",
+	"accept":          "Accept",
+	"accept-language": "Accept-Language",
+	"accept-encoding": "Accept-Encoding",
+}
+
+// allowedHeaderList is the allow list in a stable order, for error messages.
+const allowedHeaderList = "User-Agent, Referer, Origin, Authorization, Cookie, Accept, Accept-Language, Accept-Encoding"
+
+// RequestHeader is one header a caller asked to send upstream.
+type RequestHeader struct {
+	Name  string
+	Value string
+}
+
+// ParseRequestHeader parses a "Name: Value" pair and rejects a name that is not
+// on the allow list.
+func ParseRequestHeader(spec string) (RequestHeader, error) {
+	name, value, found := strings.Cut(spec, ":")
+	if !found {
+		return RequestHeader{}, fmt.Errorf("header %q must be written as Name: Value", spec)
+	}
+	return NewRequestHeader(name, value)
+}
+
+// NewRequestHeader builds a header, rejecting a name that is not allowed.
+func NewRequestHeader(name, value string) (RequestHeader, error) {
+	name = strings.TrimSpace(name)
+	value = strings.TrimSpace(value)
+	if name == "" {
+		return RequestHeader{}, errors.New("header name is empty")
+	}
+	canonical, ok := allowedRequestHeaders[strings.ToLower(name)]
+	if !ok {
+		return RequestHeader{}, fmt.Errorf("header %q is not allowed; allowed names are %s", name, allowedHeaderList)
+	}
+	// A header value must not smuggle a line break into the request.
+	if strings.ContainsAny(value, "\r\n") {
+		return RequestHeader{}, fmt.Errorf("header %q has a value containing a line break", name)
+	}
+	return RequestHeader{Name: canonical, Value: value}, nil
+}
+
 // Options configures a Client.
 type Options struct {
 	// UserAgent is sent with every upstream request.
@@ -42,6 +97,11 @@ type Options struct {
 	Referer string
 	// Header holds extra headers merged into every upstream request.
 	Header http.Header
+	// PerRequestHeader holds headers supplied by the caller for this one
+	// conversion. They are merged into every upstream request, playlist,
+	// initialisation segment and media segment alike, and take precedence over
+	// UserAgent, Referer and Header.
+	PerRequestHeader []RequestHeader
 	// HTTPClient performs upstream requests. A default client is used when nil.
 	HTTPClient *http.Client
 	// RequestTimeout bounds a single upstream request. Defaults to 20 seconds.
@@ -734,6 +794,20 @@ func (c *Client) resolve(ref string) (*url.URL, error) {
 	return c.base.ResolveReference(u), nil
 }
 
+// applyRequestHeaders sets the caller supplied headers on a request. Set is
+// used rather than Add so a caller value replaces the default.
+func applyRequestHeaders(req *http.Request, headers []RequestHeader) {
+	for _, h := range headers {
+		if h.Value == "" {
+			// An empty value means "do not send this header at all", which is
+			// how a caller suppresses the default Referer.
+			req.Header.Del(h.Name)
+			continue
+		}
+		req.Header.Set(h.Name, h.Value)
+	}
+}
+
 // get performs one upstream request, optionally restricted to a byte range,
 // retrying transient failures.
 // It returns the body and the final URL after redirects.
@@ -784,6 +858,9 @@ func (c *Client) getOnce(ctx context.Context, rawURL string, length, offset int6
 			req.Header.Add(k, v)
 		}
 	}
+	// Headers supplied by the caller win, so a stream that needs a specific
+	// User-Agent or Referer can be played from a plain URL.
+	applyRequestHeaders(req, c.opts.PerRequestHeader)
 	if length > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
 	}

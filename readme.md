@@ -20,13 +20,14 @@
 这样区分是必要的：像 `/room/v1/Room/get_info?url=...` 这种接口本身也可能带
 `url` 参数，如果只看参数名就会被误吞。
 
-| 请求 | 行为 |
-| --- | --- |
-| `/index.flv?url=https%3A%2F%2F...%2Fa.m3u8` | 转成 FLV 流返回 |
-| `/index.flv`（不带任何查询串，GET） | 返回用法说明 |
-| `/index.flv?url=file%3A%2F%2F%2Fetc%2Fpasswd` | 目标非法，按普通请求转发 |
-| `/room/v1/Room/get_info?room_id=1` | 转发到上游 |
-| `/room/v1/Room/get_info?room_id=1&url=...` | 转发到上游，`url` 参数原样保留 |
+| 请求                                               | 行为                          |
+| -------------------------------------------------- | ----------------------------- |
+| `/index.flv?url=https%3A%2F%2F...%2Fa.m3u8`        | 转成 FLV 流返回               |
+| `/index.flv?url=...&ua=...&referer=...&header=...` | 同上，并按需覆盖上游请求头    |
+| `/index.flv`（不带任何查询串，GET）                | 返回用法说明                  |
+| `/index.flv?url=file%3A%2F%2F%2Fetc%2Fpasswd`      | 目标非法，返回 400 并说明原因 |
+| `/index.flv?url=...&header=Host%3A+x`              | 头名不在白名单，返回 400      |
+| `/room/v1/Room/get_info?room_id=1`                 | 转发到上游                    |
 
 ## 运行
 
@@ -68,6 +69,46 @@ $u = [uri]::EscapeDataString($M3U8)
 curl.exe -s "http://127.0.0.1:8080/index.flv?url=$u" -o out.flv
 ```
 
+### 自定义请求头
+
+有些源靠 `Referer`/`User-Agent` 防盗链，可以在 URL 上直接覆盖。这些头会作用到
+**全部上游请求**（m3u8、初始化段、分片），因为多数源对分片同样校验：
+
+| 参数       | 说明                               |
+| ---------- | ---------------------------------- |
+| `ua=`      | 覆盖 `User-Agent`                  |
+| `referer=` | 覆盖 `Referer`                     |
+| `origin=`  | 覆盖 `Origin`                      |
+| `header=`  | 通用形式 `Name: Value`，**可重复** |
+
+```
+http://127.0.0.1:8080/index.flv?url=<encoded>&ua=<encoded>&referer=<encoded>
+```
+
+```sh
+$U=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$M3U8")
+$R=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "https://live.bilibili.com/")
+curl -s "http://127.0.0.1:8080/index.flv?url=$U&referer=$R" -o out.flv
+```
+
+`header=` 只接受白名单里的名字，其它一律返回 400 并给出原因：
+
+```
+User-Agent, Referer, Origin, Authorization, Cookie,
+Accept, Accept-Language, Accept-Encoding
+```
+
+这是刻意的：如果允许任意头透传，`Host`/`Content-Length`/`Connection` 这类头
+会直接破坏请求，而且等于把服务变成任意 header 的转发器。`Host`、
+`Content-Type`、`X-Forwarded-*`、`Proxy-Authorization` 都不在白名单内，带上
+会得到 400。值里含换行也会被拒绝，避免请求头注入。
+
+两个细节：
+
+- 参数**存在但为空**表示"清除该头"，例如 `&referer=` 会让请求不带 `Referer`
+  （默认行为是按上游域名自动推导一个）。参数**不存在**则保留默认值。
+- 这些覆盖优先于 `-user-agent` / `-referer` 命令行默认值。
+
 ### 播放
 
 ```
@@ -86,32 +127,47 @@ curl "http://127.0.0.1:8080/room/v1/Room/get_info?room_id=1"
 如果调用方带的 `Referer`/`Origin` 指向网关自己，会被去掉，避免把网关地址
 泄露给上游。
 
+每个被转发的请求都会记一行日志，含方法、路径、上游状态、响应大小和耗时：
+
+```
+2026/10/12 03:35:19 proxy GET /room/v1/Room/get_info -> 200 (1623 bytes, 126ms)
+2026/10/12 03:35:19 proxy GET /this/path/does/not/exist -> 404 (16 bytes, 173ms)
+2026/10/12 03:35:19 proxy POST /api/submit -> 200 (85 bytes, 127ms)
+```
+
+默认**不记录查询串**，因为里面常有 `token`/`sign` 这类凭据，落盘不合适；
+需要时加 `-v`：
+
+```
+2026/10/12 03:35:30 proxy GET /room/v1/Room/get_info?room_id=1&token=secret123 -> 200 (1623 bytes, 128ms)
+```
+
 ## 参数
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `-addr` | `127.0.0.1:8080` | 监听地址 |
-| `-proxy-target` | `https://api.live.bilibili.com` | 非 FLV 请求转发到的上游根地址；留空则关闭转发（返回 404） |
-| `-user-agent` | 内置浏览器 UA | 请求上游时使用的 `User-Agent` |
-| `-referer` | 上游根地址 | 请求上游时使用的 `Referer` |
-| `-request-timeout` | `20s` | 单个上游请求的超时时间 |
-| `-live` | `false` | 跳过直播列表里已缓冲的旧分片，尽量从最新处开始 |
-| `-v` | `false` | 在 stderr 打印每个分片的进度 |
+| 参数               | 默认值                          | 说明                                                      |
+| ------------------ | ------------------------------- | --------------------------------------------------------- |
+| `-addr`            | `127.0.0.1:8080`                | 监听地址                                                  |
+| `-proxy-target`    | `https://api.live.bilibili.com` | 非 FLV 请求转发到的上游根地址；留空则关闭转发（返回 404） |
+| `-user-agent`      | 内置浏览器 UA                   | 请求上游时使用的 `User-Agent`                             |
+| `-referer`         | 上游根地址                      | 请求上游时使用的 `Referer`                                |
+| `-request-timeout` | `20s`                           | 单个上游请求的超时时间                                    |
+| `-live`            | `false`                         | 跳过直播列表里已缓冲的旧分片，尽量从最新处开始            |
+| `-v`               | `false`                         | 打印每个分片的进度，并在转发日志里带上查询串              |
 
 ## 实现
 
-| 包 | 职责 |
-| --- | --- |
-| `main.go` | HTTP 服务：路由（FLV 转换 vs 反向代理）、转发逻辑 |
-| `internal/m3u8` | 解析 HLS 播放列表（`EXTINF`、`EXT-X-MAP`、`EXT-X-BYTERANGE`、`EXT-X-KEY`、`EXT-X-MEDIA-SEQUENCE`、主列表变体等） |
-| `internal/mp4` | 解析 fMP4/CMAF 分片：`moov` 初始化段与 `moof`/`trun`/`mdat` 媒体段 |
-| `internal/flv` | 生成 FLV：文件头、AVC/HEVC 视频标签、AAC 音频标签、AMF0 `onMetaData` |
-| `internal/hlsflv` | 串联整个流程：拉取播放列表、下载分片、重封装、直播列表重载 |
+| 包                | 职责                                                                                                             |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `main.go`         | HTTP 服务：路由（FLV 转换 vs 反向代理）、转发逻辑                                                                |
+| `internal/m3u8`   | 解析 HLS 播放列表（`EXTINF`、`EXT-X-MAP`、`EXT-X-BYTERANGE`、`EXT-X-KEY`、`EXT-X-MEDIA-SEQUENCE`、主列表变体等） |
+| `internal/mp4`    | 解析 fMP4/CMAF 分片：`moov` 初始化段与 `moof`/`trun`/`mdat` 媒体段                                               |
+| `internal/flv`    | 生成 FLV：文件头、AVC/HEVC 视频标签、AAC 音频标签、AMF0 `onMetaData`                                             |
+| `internal/hlsflv` | 串联整个流程：拉取播放列表、下载分片、重封装、直播列表重载                                                       |
 
 支持的编码：
 
-* 视频 H.264（`avc1`/`avc3`）与 H.265（`hvc1`/`hev1`）
-* 音频 AAC（`mp4a`）与 Opus
+- 视频 H.264（`avc1`/`avc3`）与 H.265（`hvc1`/`hev1`）
+- 音频 AAC（`mp4a`）与 Opus
 
 不支持的输入会返回明确错误，而不是产出损坏的流：带 CENC 加密的分片、
 没有 `EXT-X-MAP` 的 MPEG-TS 播放列表、以及 FLV 无法承载的编码。
@@ -158,7 +214,7 @@ go test ./internal/hlsflv/ -run TestLive -v
 
 ## 已知限制
 
-* 只支持 fMP4/CMAF 分片（`EXT-X-MAP`）。MPEG-TS 分片尚未实现。
-* 加密流（`EXT-X-KEY`）会以明确的错误跳过该分片，不做解密。
-* 直播流没有时长，因此不会写入 `duration` 元数据字段；点播流也没有实现，
+- 只支持 fMP4/CMAF 分片（`EXT-X-MAP`）。MPEG-TS 分片尚未实现。
+- 加密流（`EXT-X-KEY`）会以明确的错误跳过该分片，不做解密。
+- 直播流没有时长，因此不会写入 `duration` 元数据字段；点播流也没有实现，
   因为播放列表里的总时长需要遍历全部分片。
