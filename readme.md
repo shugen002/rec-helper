@@ -127,20 +127,58 @@ curl "http://127.0.0.1:8080/room/v1/Room/get_info?room_id=1"
 如果调用方带的 `Referer`/`Origin` 指向网关自己，会被去掉，避免把网关地址
 泄露给上游。
 
-每个被转发的请求都会记一行日志，含方法、路径、上游状态、响应大小和耗时：
+每个被转发的请求都会记一行日志，详见下面的「日志」一节。
+
+## 日志
+
+每次拉流都会分配一个**随机的 8 位十六进制 session id**，该次拉流产生的所有日志
+行都以 `[session-id]` 开头，因此并发多个流时能直接把同一个流的日志挑出来：
 
 ```
-2026/10/12 03:35:19 proxy GET /room/v1/Room/get_info -> 200 (1623 bytes, 126ms)
-2026/10/12 03:35:19 proxy GET /this/path/does/not/exist -> 404 (16 bytes, 173ms)
-2026/10/12 03:35:19 proxy POST /api/submit -> 200 (85 bytes, 127ms)
+05:23:07 [32f9af7d] flv request from 127.0.0.1: url=https://.../index.m3u8
+05:23:07 [32f9af7d] hlsflv: fetching playlist https://.../index.m3u8
+05:23:08 [32f9af7d] hlsflv: stream info: video=avc1.64002a 1920x1080 59fps audio=mp4a.40.2 48000Hz 2ch
+05:23:09 [32f9af7d] hlsflv: stream ended after 2.172s: ..., 8 segments, 717 tags, 6.5 MiB, reason=cancelled
+05:23:07 [bc3ec84d] flv request from 127.0.0.1: url=https://.../index.m3u8
+05:23:08 [bc3ec84d] hlsflv: stream info: video=avc1.64002a 1920x1080 59fps audio=mp4a.40.2 48000Hz 2ch
+05:23:17 [bc3ec84d] hlsflv: stream ended after 10.004s: ..., 22 segments, 1761 tags, 16.3 MiB, reason=cancelled
 ```
 
-默认**不记录查询串**，因为里面常有 `token`/`sign` 这类凭据，落盘不合适；
-需要时加 `-v`：
+ID 由 `crypto/rand` 生成，会同时通过响应头 `X-Session-Id` 返回给客户端，
+便于用户报问题时直接引用：
 
 ```
-2026/10/12 03:35:30 proxy GET /room/v1/Room/get_info?room_id=1&token=secret123 -> 200 (1623 bytes, 128ms)
+$ curl -sD - -o /dev/null "http://127.0.0.1:8080/index.flv?url=..."
+HTTP/1.1 200 OK
+X-Session-Id: bc3ec84d
 ```
+
+转发请求也各自有独立 session id。
+
+### FLV 转换
+
+一次转换记四行，无论是否加了 `-v`：
+
+* `flv request from <调用方 IP>: url=<m3u8 地址>`，并列出这次请求覆盖了哪些头
+  （只记名字，**不记值**，因为 `Cookie`/`Authorization` 里是凭据）。
+* `fetching playlist` —— 实际开始拉取的地址；主列表会额外记一行
+  `selected variant`，因为此时分片来源和请求地址不同。
+* `stream info` —— 解码器配置就绪后输出，即编解码器、分辨率、帧率、采样率。
+* `stream ended` —— 汇总耗时、分片数、标签数、字节数，以及 `reason`：
+  `end of stream`（播放列表播完）、`cancelled`、`deadline exceeded`、
+  `client disconnected`（播放器停止拉流）、或 `error: ...`。
+
+加 `-v` 时会额外打印每个分片的进度。
+
+### 转发请求
+
+每个被转发的请求记一行，含方法、路径、上游状态、响应大小和耗时：
+
+```
+2026/10/12 05:23:17 [4604d2be] proxy GET /room/v1/Room/get_info -> 200 (1623 bytes, 76ms)
+```
+
+默认**不记录查询串**，因为里面常有 `token`/`sign` 这类凭据；需要时加 `-v`。
 
 ## 参数
 

@@ -80,7 +80,10 @@ func main() {
 				Referer:        *referer,
 				RequestTimeout: *timeout,
 				StartFromLive:  *liveOnly,
-				Logger:         verboseLog,
+				// Lifecycle events always reach the log; per segment progress
+				// only when asked for.
+				EventLogger: logger.Printf,
+				Logger:      verboseLog,
 			},
 		},
 		// No write timeout: an FLV response stays open for the whole session.
@@ -379,8 +382,13 @@ func (h *handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 	// Wrap the writer so the log line can report what the upstream answered.
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	start := time.Now()
-	h.proxy.ServeHTTP(rec, r)
 
+	// A proxied request is its own session, so its lines carry an ID too and
+	// can be told apart from other traffic.
+	sessionID, err := hlsflv.NewSessionID()
+	if err != nil {
+		sessionID = "unknown"
+	}
 	target := r.URL.Path
 	if h.verbose {
 		// The query string can carry tokens and signatures, so it is only
@@ -389,8 +397,10 @@ func (h *handler) serveProxy(w http.ResponseWriter, r *http.Request) {
 			target += "?" + r.URL.RawQuery
 		}
 	}
-	h.logger.Printf("proxy %s %s -> %d (%d bytes, %s)",
-		r.Method, target, rec.status, rec.written, time.Since(start).Round(time.Millisecond))
+	h.proxy.ServeHTTP(rec, r)
+	h.logger.Printf("[%s] proxy %s %s -> %d (%d bytes, %s)",
+		sessionID, r.Method, target, rec.status, rec.written,
+		time.Since(start).Round(time.Millisecond))
 }
 
 // statusRecorder remembers the status code and body size written by the proxy.
@@ -438,6 +448,35 @@ func (h *handler) serveFLV(w http.ResponseWriter, r *http.Request, req flvReques
 		return
 	}
 
+	opts := h.opts
+	opts.PerRequestHeader = req.headers
+	if opts.Logger == nil {
+		opts.Logger = func(string, ...any) {}
+	}
+	if opts.EventLogger == nil {
+		opts.EventLogger = func(string, ...any) {}
+	}
+
+	// The client owns the session ID, so it is created before the first log
+	// line and every line of this conversion carries that ID.
+	client, err := hlsflv.New(req.target, &flushWriter{w: w, f: flusher}, opts)
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Printf("flv request rejected: url=%s: %v", req.target, err)
+		}
+		http.Error(w, "cannot start the conversion", http.StatusBadGateway)
+		return
+	}
+
+	// Log the playlist being requested, so a conversion can be traced back to
+	// the URL a client actually asked for.
+	if h.logger != nil {
+		h.logger.Printf("[%s] flv request from %s: url=%s%s",
+			client.SessionID(), clientIP(r), req.target, describeOverrideHeaders(req.headers))
+	}
+	// Handing the ID back lets a client quote it when reporting a problem.
+	w.Header().Set("X-Session-Id", client.SessionID())
+
 	w.Header().Set("Content-Type", "video/x-flv")
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.WriteHeader(http.StatusOK)
@@ -447,27 +486,31 @@ func (h *handler) serveFLV(w http.ResponseWriter, r *http.Request, req flvReques
 		return
 	}
 
-	opts := h.opts
-	opts.PerRequestHeader = req.headers
-	if opts.Logger == nil {
-		opts.Logger = func(string, ...any) {}
-	}
+	// The client reports the stream info and the end of the stream itself.
+	_ = client.Run(r.Context())
+}
 
-	// hlsflv writes through a flushWriter so every segment reaches the client
-	// immediately instead of waiting in net/http's output buffer.
-	client, err := hlsflv.New(req.target, &flushWriter{w: w, f: flusher}, opts)
+// clientIP returns the caller's address for a log line.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		// The response has already started; report on stderr and stop.
-		opts.Logger("blrechelper: %v", err)
-		return
+		return r.RemoteAddr
 	}
+	return host
+}
 
-	start := time.Now()
-	err = client.Run(r.Context())
-	stats := client.Stats()
-	opts.Logger("blrechelper: finished %s after %s: %d segments, %d tags, %.1f MiB (%v)",
-		req.target, time.Since(start).Round(time.Millisecond), stats.Segments, stats.Samples,
-		float64(stats.Bytes)/(1<<20), err)
+// describeOverrideHeaders renders the caller supplied header overrides for a log
+// line, so a hotlink protected request can be told apart from a plain one. The
+// values are not logged because they routinely carry credentials.
+func describeOverrideHeaders(headers []hlsflv.RequestHeader) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(headers))
+	for _, h := range headers {
+		names = append(names, h.Name)
+	}
+	return " headers=" + strings.Join(names, ",")
 }
 
 // usageText is the human readable help shown when the FLV endpoint is opened

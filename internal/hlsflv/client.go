@@ -10,6 +10,8 @@ package hlsflv
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -114,8 +116,14 @@ type Options struct {
 	MaxPlaylistReloads int
 	// StartFromLive skips most of the backlog of a live playlist.
 	StartFromLive bool
-	// Logger receives diagnostics. Nil disables logging.
+	// Logger receives diagnostics. Nil disables logging. It is used for
+	// per segment progress, which is only meaningful when verbose logging is on.
 	Logger func(format string, args ...any)
+	// EventLogger receives the lifecycle events of one conversion: the playlist
+	// being fetched, the tracks that were found, and how the stream ended. It is
+	// separate from Logger so these always reach the log even when per segment
+	// progress is turned off. Nil disables logging.
+	EventLogger func(format string, args ...any)
 	// OnTag, when set, is called for every FLV tag that is produced. It is
 	// intended for tests and diagnostics and must not retain the payload.
 	OnTag func(TagInfo)
@@ -157,6 +165,13 @@ func (o *Options) applyDefaults() {
 func (o *Options) logf(format string, args ...any) {
 	if o.Logger != nil {
 		o.Logger(format, args...)
+	}
+}
+
+// eventf reports a lifecycle event.
+func (o *Options) eventf(format string, args ...any) {
+	if o.EventLogger != nil {
+		o.EventLogger(format, args...)
 	}
 }
 
@@ -255,9 +270,31 @@ func (t *tagCollector) WriteOpusRaw(data []byte, ts int64) error {
 	return t.writer.WriteOpusRaw(data, ts)
 }
 
+// SessionIDLength is the number of hexadecimal characters in a session ID.
+const SessionIDLength = 8
+
+// NewSessionID returns a random hexadecimal session ID.
+//
+// It is generated from crypto/rand so that concurrent sessions do not collide
+// and the value is not guessable from another session's log line.
+func NewSessionID() (string, error) {
+	buf := make([]byte, SessionIDLength/2)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("hlsflv: generating a session ID: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// newSessionID is the internal spelling used while constructing a Client.
+func newSessionID() (string, error) { return NewSessionID() }
+
 // Client converts one HLS stream into FLV.
 type Client struct {
 	opts Options
+
+	// sessionID identifies this conversion in the logs. Every line this client
+	// writes starts with it, so concurrent streams can be told apart.
+	sessionID string
 
 	// base is the playlist URL, used to resolve every relative reference.
 	base *url.URL
@@ -289,6 +326,10 @@ type Client struct {
 	frameRateVotes int
 
 	videoSeq, audioSeq bool
+
+	// streamLogged records that the stream info line has been emitted, so it is
+	// reported once after the frame rate is known.
+	streamLogged bool
 
 	// clientGone is set once the output side has failed. It is sticky, so the
 	// caller stops even if it loses the wrapped error.
@@ -323,14 +364,19 @@ func NewWithSink(playlistURL string, out io.Writer, sink TagSink, opts Options) 
 	if sink == nil {
 		return nil, errors.New("hlsflv: nil tag sink")
 	}
+	sessionID, err := newSessionID()
+	if err != nil {
+		return nil, err
+	}
 	c := &Client{
-		opts:   opts,
-		base:   base,
-		w:      sink,
-		out:    out,
-		seen:   map[string]bool{},
-		clocks: map[uint32]*trackClock{},
-		tag:    opts.OnTag,
+		opts:      opts,
+		sessionID: sessionID,
+		base:      base,
+		w:         sink,
+		out:       out,
+		seen:      map[string]bool{},
+		clocks:    map[uint32]*trackClock{},
+		tag:       opts.OnTag,
 	}
 	if tc, ok := sink.(*tagCollector); ok {
 		c.collector = tc
@@ -360,6 +406,24 @@ func (c *Client) reportTag(t TagInfo) {
 	}
 }
 
+// SessionID returns the identifier this conversion logs under, so a caller can
+// prefix its own log lines with the same value.
+func (c *Client) SessionID() string { return c.sessionID }
+
+// eventf reports a lifecycle event for this session.
+func (c *Client) eventf(format string, args ...any) {
+	if c.opts.EventLogger != nil {
+		c.opts.EventLogger("[%s] "+format, append([]any{c.sessionID}, args...)...)
+	}
+}
+
+// logf reports per segment progress for this session.
+func (c *Client) logf(format string, args ...any) {
+	if c.opts.Logger != nil {
+		c.opts.Logger("[%s] "+format, append([]any{c.sessionID}, args...)...)
+	}
+}
+
 // Stats returns a snapshot of the conversion counters.
 func (c *Client) Stats() Stats {
 	s := c.stats
@@ -368,21 +432,34 @@ func (c *Client) Stats() Stats {
 
 // Run performs the conversion until the stream ends, ctx is cancelled or an
 // unrecoverable error occurs.
-func (c *Client) Run(ctx context.Context) error {
+func (c *Client) Run(ctx context.Context) (err error) {
 	c.stats.StartedAt = time.Now()
-	defer func() { c.stats.EndedAt = time.Now() }()
+	// One line reports how the conversion ended, whichever way it ended.
+	defer func() {
+		c.stats.EndedAt = time.Now()
+		st := c.stats
+		c.eventf("hlsflv: stream ended after %s: %s, %d segments, %d tags, %.1f MiB, reason=%s",
+			st.EndedAt.Sub(st.StartedAt).Round(time.Millisecond),
+			c.describeStream(), st.Segments, st.Samples,
+			float64(st.Bytes)/(1<<20), endReason(ctx, err))
+	}()
 
-	playlist, resolved, err := c.load(ctx, c.base)
-	if err != nil {
-		return err
+	// Report the playlist being fetched, and where it resolved to, because a
+	// redirect or a master playlist means the requested URL is not the one the
+	// segments come from.
+	c.eventf("hlsflv: fetching playlist %s", c.base)
+	playlist, resolved, loadErr := c.load(ctx, c.base)
+	if loadErr != nil {
+		return loadErr
 	}
 	if playlist.Kind == m3u8.KindMaster {
 		var variantURL *url.URL
-		playlist, variantURL, err = c.selectVariant(ctx, playlist)
-		if err != nil {
-			return err
+		playlist, variantURL, loadErr = c.selectVariant(ctx, playlist)
+		if loadErr != nil {
+			return loadErr
 		}
 		resolved = variantURL
+		c.eventf("hlsflv: selected variant %s", resolved)
 	}
 	if playlist.Media == nil {
 		return errors.New("hlsflv: playlist contains no media segments")
@@ -390,6 +467,22 @@ func (c *Client) Run(ctx context.Context) error {
 	c.base = resolved
 
 	return c.follow(ctx, playlist.Media)
+}
+
+// endReason renders why a conversion stopped.
+func endReason(ctx context.Context, err error) string {
+	switch {
+	case errors.Is(err, ErrClientGone):
+		return "client disconnected"
+	case errors.Is(err, context.Canceled), errors.Is(ctx.Err(), context.Canceled):
+		return "cancelled"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "deadline exceeded"
+	case err == nil:
+		return "end of stream"
+	default:
+		return "error: " + err.Error()
+	}
 }
 
 // load fetches and parses a playlist, returning the URL it was actually read
@@ -482,10 +575,10 @@ func (c *Client) follow(ctx context.Context, pl *m3u8.MediaPlaylist) error {
 			// A failed write means the consumer is gone, so stop rather than
 			// keep fetching segments into a dead connection.
 			if errors.Is(err, ErrClientGone) {
-				c.opts.logf("hlsflv: stopping after %s: consumer disconnected", seg.URI)
+				c.logf("hlsflv: stopping after %s: consumer disconnected", seg.URI)
 				return err
 			}
-			c.opts.logf("hlsflv: segment %s failed: %v", seg.URI, err)
+			c.logf("hlsflv: segment %s failed: %v", seg.URI, err)
 		}
 		if pl.EndList {
 			return nil
@@ -566,7 +659,7 @@ func (c *Client) reload(ctx context.Context, prev *m3u8.MediaPlaylist) (*m3u8.Me
 		pl, finalURL, err := c.load(ctx, c.base)
 		if err != nil {
 			lastErr = err
-			c.opts.logf("hlsflv: playlist reload failed: %v", err)
+			c.logf("hlsflv: playlist reload failed: %v", err)
 			continue
 		}
 		if pl.Media == nil || pl.Kind == m3u8.KindMaster {
@@ -648,6 +741,11 @@ func (c *Client) processSegment(ctx context.Context, pl *m3u8.MediaPlaylist, seg
 		return err
 	}
 	c.observeFrameRate(frag.Samples)
+	// The frame rate has now been observed, so the stream is fully described.
+	if !c.streamLogged {
+		c.streamLogged = true
+		c.eventf("hlsflv: stream info: %s", c.describeStream())
+	}
 	if err := c.emit(frag.Samples); err != nil {
 		// Producing the tags failed; nothing can reach the consumer.
 		c.collector.Reset()
@@ -705,6 +803,10 @@ func (c *Client) ensureInit(ctx context.Context, pl *m3u8.MediaPlaylist, seg m3u
 	if err := c.w.WriteHeader(); err != nil {
 		return fmt.Errorf("hlsflv: writing the FLV header: %w", err)
 	}
+	// The track layout comes from the initialisation segment, so this is the
+	// first point at which the stream's codecs and dimensions are known. The
+	// frame rate is refined from real sample durations, so the stream info line
+	// is emitted after the first segment has been processed.
 	if err := c.writeMetadata(seg); err != nil {
 		return err
 	}
@@ -714,6 +816,36 @@ func (c *Client) ensureInit(ctx context.Context, pl *m3u8.MediaPlaylist, seg m3u
 	// The header, metadata and sequence headers must reach the consumer before
 	// any media, so flush them now.
 	return c.flushTags()
+}
+
+// describeStream renders the tracks of the stream for a log line.
+func (c *Client) describeStream() string {
+	var parts []string
+	if c.video != nil {
+		v := fmt.Sprintf("video=%s %dx%d", codecName(c.video), c.video.Width, c.video.Height)
+		if c.frameRate > 0 {
+			v += fmt.Sprintf(" %.0ffps", c.frameRate)
+		}
+		parts = append(parts, v)
+	} else {
+		parts = append(parts, "video=none")
+	}
+	if c.audio != nil {
+		parts = append(parts, fmt.Sprintf("audio=%s %dHz %dch",
+			codecName(c.audio), c.audio.SampleRate, c.audio.Channels))
+	} else {
+		parts = append(parts, "audio=none")
+	}
+	return strings.Join(parts, " ")
+}
+
+// codecName prefers the RFC 6381 codec string and falls back to the sample
+// entry format.
+func codecName(t *mp4.Track) string {
+	if t.CodecString != "" {
+		return t.CodecString
+	}
+	return t.Format
 }
 
 // writeMetadata emits the onMetaData script tag describing the stream. It is
