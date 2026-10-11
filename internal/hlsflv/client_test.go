@@ -634,6 +634,115 @@ func TestStartFromLiveDisabledFetchesBacklog(t *testing.T) {
 	}
 }
 
+// failWriter accepts a limited number of bytes and then fails, which is what a
+// consumer that disconnects mid-stream looks like to the client.
+type failWriter struct {
+	limit int
+	got   int
+}
+
+func (w *failWriter) Write(p []byte) (int, error) {
+	if w.got >= w.limit {
+		return 0, errors.New("connection reset by peer")
+	}
+	n := len(p)
+	if w.got+n > w.limit {
+		n = w.limit - w.got
+	}
+	w.got += n
+	if n < len(p) {
+		return n, errors.New("connection reset by peer")
+	}
+	return n, nil
+}
+
+// TestRunStopsWhenTheConsumerDisconnects covers the case where the output side
+// fails: the conversion must stop at once instead of downloading the rest of a
+// live playlist into a dead connection, which is what made a player appear to
+// hang after it had already been stopped.
+func TestRunStopsWhenTheConsumerDisconnects(t *testing.T) {
+	o := newOrigin()
+	srv := httptest.NewServer(o.handler())
+	defer srv.Close()
+
+	w := &failWriter{limit: 64}
+	c, err := New(srv.URL+"/index.m3u8", w, Options{Logger: t.Logf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	runErr := c.Run(context.Background())
+	t.Logf("Run returned: %v (wrote %d bytes of a %d byte limit)", runErr, w.got, w.limit)
+	if runErr == nil {
+		t.Fatal("Run returned nil, want an error when the output is closed")
+	}
+	if !errors.Is(runErr, ErrClientGone) {
+		t.Errorf("Run = %v, want ErrClientGone", runErr)
+	}
+
+	// Only the first segments should have been fetched; the rest of the
+	// playlist must not be pulled into a dead connection.
+	if n := o.countOf("/seg1.m4s"); n != 0 {
+		t.Errorf("fetched /seg1.m4s %d times after the output closed, want 0", n)
+	}
+}
+
+// TestRunStopsWhenOutputClosesMidLiveStream is the same check against an
+// endless playlist, where a missing stop would loop forever.
+func TestRunStopsWhenOutputClosesMidLiveStream(t *testing.T) {
+	initData := initSegment()
+	seg := mediaSegment(2, [][]byte{{0, 0, 0, 1, 0x41, 1}}, 0, 3000, 0)
+
+	var mu sync.Mutex
+	fetched := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/live.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-MAP:URI=\"init.mp4\"\n"+
+			"#EXTINF:1.00,\nseg0.m4s\n")
+	})
+	mux.HandleFunc("/init.mp4", func(w http.ResponseWriter, r *http.Request) { w.Write(initData) })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/seg") {
+			mu.Lock()
+			fetched++
+			mu.Unlock()
+			w.Write(seg)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	w := &failWriter{limit: 40}
+	c, err := New(srv.URL+"/live.m3u8", w, Options{
+		PlaylistInterval: 5 * time.Millisecond,
+		Logger:           func(string, ...any) {},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClientGone) {
+			t.Errorf("Run = %v, want ErrClientGone", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop on an endless playlist after the output closed")
+	}
+
+	mu.Lock()
+	n := fetched
+	mu.Unlock()
+	if n > 3 {
+		t.Errorf("kept fetching after the output closed: %d segment requests", n)
+	}
+}
+
 func TestCodecsSupported(t *testing.T) {
 	cases := []struct {
 		codecs string

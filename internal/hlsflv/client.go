@@ -8,6 +8,7 @@
 package hlsflv
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -170,6 +171,90 @@ type Stats struct {
 	EndedAt   time.Time
 }
 
+// TagSink receives the FLV tags the client produces.
+//
+// Collecting tags before writing them keeps the output side in one place, so a
+// failure to write is detected once and cannot be mistaken for an upstream
+// problem. internal/flv.Writer implements it.
+type TagSink interface {
+	WriteHeader() error
+	SetFlags(audio, video bool)
+	WriteMetadata(timestamp int64, md flv.Metadata) error
+	WriteAVCSequenceHeader(record []byte) error
+	WriteHEVCSequenceHeader(record []byte) error
+	WriteAVCNALU(data []byte, timestamp int64, cts int32, keyframe bool) error
+	WriteHEVCNALU(data []byte, timestamp int64, cts int32, keyframe bool) error
+	WriteAACSequenceHeader(asc []byte) error
+	WriteAACRaw(data []byte, timestamp int64) error
+	WriteOpusSequenceHeader(dops []byte) error
+	WriteOpusRaw(data []byte, timestamp int64) error
+}
+
+// tagCollector buffers FLV tags in memory so they can be written to the real
+// destination in one go, keeping write error handling in a single place.
+type tagCollector struct {
+	writer flv.Writer
+	buf    bytes.Buffer
+}
+
+// NewTagCollector returns a TagSink that buffers tags for FlushTo.
+func NewTagCollector() *tagCollector {
+	t := &tagCollector{}
+	t.writer = *flv.NewWriter(&t.buf)
+	return t
+}
+
+// FlushTo appends every buffered byte to dst, or reports dst's error. The
+// buffer is only cleared when the write succeeded, so a failed segment can be
+// discarded without losing track of what was already sent.
+func (t *tagCollector) FlushTo(dst io.Writer) error {
+	if t.buf.Len() == 0 {
+		return nil
+	}
+	if _, err := dst.Write(t.buf.Bytes()); err != nil {
+		return err
+	}
+	t.buf.Reset()
+	return nil
+}
+
+// Reset discards everything buffered but not yet written.
+func (t *tagCollector) Reset() { t.buf.Reset() }
+
+// The collector embeds no methods, so the tag writing API is forwarded
+// explicitly to the inner writer.
+func (t *tagCollector) WriteHeader() error { return t.writer.WriteHeader() }
+func (t *tagCollector) SetFlags(audio, video bool) {
+	t.writer.SetFlags(audio, video)
+}
+func (t *tagCollector) WriteMetadata(ts int64, md flv.Metadata) error {
+	return t.writer.WriteMetadata(ts, md)
+}
+func (t *tagCollector) WriteAVCSequenceHeader(record []byte) error {
+	return t.writer.WriteAVCSequenceHeader(record)
+}
+func (t *tagCollector) WriteHEVCSequenceHeader(record []byte) error {
+	return t.writer.WriteHEVCSequenceHeader(record)
+}
+func (t *tagCollector) WriteAVCNALU(data []byte, ts int64, cts int32, key bool) error {
+	return t.writer.WriteAVCNALU(data, ts, cts, key)
+}
+func (t *tagCollector) WriteHEVCNALU(data []byte, ts int64, cts int32, key bool) error {
+	return t.writer.WriteHEVCNALU(data, ts, cts, key)
+}
+func (t *tagCollector) WriteAACSequenceHeader(asc []byte) error {
+	return t.writer.WriteAACSequenceHeader(asc)
+}
+func (t *tagCollector) WriteAACRaw(data []byte, ts int64) error {
+	return t.writer.WriteAACRaw(data, ts)
+}
+func (t *tagCollector) WriteOpusSequenceHeader(dops []byte) error {
+	return t.writer.WriteOpusSequenceHeader(dops)
+}
+func (t *tagCollector) WriteOpusRaw(data []byte, ts int64) error {
+	return t.writer.WriteOpusRaw(data, ts)
+}
+
 // Client converts one HLS stream into FLV.
 type Client struct {
 	opts Options
@@ -186,8 +271,13 @@ type Client struct {
 	mapRange    int64
 	mapRangeOff int64
 
-	w   *flv.Writer
+	// w collects tags; the write to out happens once per flush, which keeps
+	// write error handling in a single place.
+	w   TagSink
 	out io.Writer
+	// collector, when set, holds the buffered tags. It is nil when the caller
+	// supplied its own TagSink.
+	collector *tagCollector
 
 	seen map[string]bool
 
@@ -200,6 +290,10 @@ type Client struct {
 
 	videoSeq, audioSeq bool
 
+	// clientGone is set once the output side has failed. It is sticky, so the
+	// caller stops even if it loses the wrapped error.
+	clientGone bool
+
 	// tag, when non-nil, observes every produced FLV tag.
 	tag func(TagInfo)
 
@@ -208,6 +302,13 @@ type Client struct {
 
 // New creates a Client that writes FLV to out for the playlist at playlistURL.
 func New(playlistURL string, out io.Writer, opts Options) (*Client, error) {
+	return NewWithSink(playlistURL, out, NewTagCollector(), opts)
+}
+
+// NewWithSink creates a Client that produces tags through sink and flushes them
+// to out. It exists for tests that need to inspect the tags before they are
+// written.
+func NewWithSink(playlistURL string, out io.Writer, sink TagSink, opts Options) (*Client, error) {
 	opts.applyDefaults()
 	base, err := url.Parse(playlistURL)
 	if err != nil {
@@ -219,15 +320,37 @@ func New(playlistURL string, out io.Writer, opts Options) (*Client, error) {
 	if base.Host == "" {
 		return nil, errors.New("hlsflv: playlist URL has no host")
 	}
-	return &Client{
+	if sink == nil {
+		return nil, errors.New("hlsflv: nil tag sink")
+	}
+	c := &Client{
 		opts:   opts,
 		base:   base,
-		w:      flv.NewWriter(out),
+		w:      sink,
 		out:    out,
 		seen:   map[string]bool{},
 		clocks: map[uint32]*trackClock{},
 		tag:    opts.OnTag,
-	}, nil
+	}
+	if tc, ok := sink.(*tagCollector); ok {
+		c.collector = tc
+	}
+	return c, nil
+}
+
+// flushTags writes everything the collector has buffered to the destination.
+//
+// It is the single place where the output side is written, so a failure here is
+// unambiguously the consumer's problem rather than an upstream one.
+func (c *Client) flushTags() error {
+	if c.collector == nil {
+		return nil
+	}
+	if err := c.collector.FlushTo(c.out); err != nil {
+		c.clientGone = true
+		return fmt.Errorf("%w: %v", ErrClientGone, err)
+	}
+	return nil
 }
 
 // reportTag publishes a produced tag to the diagnostic hook, if any.
@@ -331,6 +454,11 @@ func (c *Client) selectVariant(ctx context.Context, pl *m3u8.Playlist) (*m3u8.Pl
 	return nil, nil, lastErr
 }
 
+// ErrClientGone reports that the output side failed, which means the consumer
+// disconnected or stopped reading. It is fatal: continuing would keep
+// downloading segments nobody will ever receive.
+var ErrClientGone = errors.New("hlsflv: output closed by the client")
+
 // follow processes segments in order, reloading the playlist as it goes.
 func (c *Client) follow(ctx context.Context, pl *m3u8.MediaPlaylist) error {
 	for {
@@ -342,9 +470,22 @@ func (c *Client) follow(ctx context.Context, pl *m3u8.MediaPlaylist) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if err := c.processSegment(ctx, pl, seg); err != nil {
-				c.opts.logf("hlsflv: segment %s failed: %v", seg.URI, err)
+			// The output may have failed while an earlier segment of this same
+			// batch was being written, so check before doing any more work.
+			if c.clientGone {
+				return ErrClientGone
 			}
+			err := c.processSegment(ctx, pl, seg)
+			if err == nil {
+				continue
+			}
+			// A failed write means the consumer is gone, so stop rather than
+			// keep fetching segments into a dead connection.
+			if errors.Is(err, ErrClientGone) {
+				c.opts.logf("hlsflv: stopping after %s: consumer disconnected", seg.URI)
+				return err
+			}
+			c.opts.logf("hlsflv: segment %s failed: %v", seg.URI, err)
 		}
 		if pl.EndList {
 			return nil
@@ -508,6 +649,12 @@ func (c *Client) processSegment(ctx context.Context, pl *m3u8.MediaPlaylist, seg
 	}
 	c.observeFrameRate(frag.Samples)
 	if err := c.emit(frag.Samples); err != nil {
+		// Producing the tags failed; nothing can reach the consumer.
+		c.collector.Reset()
+		return err
+	}
+	// One flush per segment: a write failure is reported here and nowhere else.
+	if err := c.flushTags(); err != nil {
 		return err
 	}
 	return nil
@@ -558,15 +705,22 @@ func (c *Client) ensureInit(ctx context.Context, pl *m3u8.MediaPlaylist, seg m3u
 	if err := c.w.WriteHeader(); err != nil {
 		return fmt.Errorf("hlsflv: writing the FLV header: %w", err)
 	}
-	c.writeMetadata(seg)
-	return c.writeSequenceHeaders()
+	if err := c.writeMetadata(seg); err != nil {
+		return err
+	}
+	if err := c.writeSequenceHeaders(); err != nil {
+		return err
+	}
+	// The header, metadata and sequence headers must reach the consumer before
+	// any media, so flush them now.
+	return c.flushTags()
 }
 
 // writeMetadata emits the onMetaData script tag describing the stream. It is
 // written before the sequence headers of each new decoder configuration.
-func (c *Client) writeMetadata(seg m3u8.MediaSegment) {
+func (c *Client) writeMetadata(seg m3u8.MediaSegment) error {
 	if c.video == nil && c.audio == nil {
-		return
+		return nil
 	}
 	md := flv.Metadata{Encoder: "blrechelper"}
 	if c.video != nil {
@@ -582,10 +736,13 @@ func (c *Client) writeMetadata(seg m3u8.MediaSegment) {
 		md.Stereo = c.audio.Channels > 1
 		md.AudioCodecID = flv.SoundAAC
 	}
-	// The script tag timestamp is zero because it precedes all media.
+	// The script tag timestamp is zero because it precedes all media. A failure
+	// here is reported rather than logged away: writing an empty stream is
+	// worse than stopping.
 	if err := c.w.WriteMetadata(0, md); err != nil {
-		c.opts.logf("hlsflv: writing metadata: %v", err)
+		return fmt.Errorf("hlsflv: writing the metadata tag: %w", err)
 	}
+	return nil
 }
 
 // observeFrameRate derives the video frame rate from real sample durations and
@@ -613,22 +770,6 @@ func (c *Client) observeFrameRate(samples []mp4.Sample) {
 			c.frameRateVotes = n
 			c.frameRate = float64(fps)
 		}
-	}
-}
-
-// reportConfigTags publishes the metadata and sequence header tags.
-func (c *Client) reportConfigTags(scriptSize int) {
-	if c.tag == nil {
-		return
-	}
-	if scriptSize > 0 {
-		c.reportTag(TagInfo{Type: flv.TagScript, Size: scriptSize})
-	}
-	if c.videoSeq {
-		c.reportTag(TagInfo{Type: flv.TagVideo, Keyframe: true})
-	}
-	if c.audioSeq {
-		c.reportTag(TagInfo{Type: flv.TagAudio})
 	}
 }
 
@@ -665,12 +806,15 @@ func (c *Client) writeSequenceHeaders() error {
 	return nil
 }
 
-// emit writes one segment's samples in presentation order.
+// emit writes one segment's samples in decode order.
 //
-// Samples must be interleaved by presentation timestamp for players that
-// expect well ordered tags. Because the tracks of a stream may use different
-// timescales and unrelated baseDecodeTime values, each track's timeline origin
-// is pinned first and the comparison is then made in milliseconds.
+// Samples are ordered by decode timestamp, never by presentation timestamp.
+// With B frames the two orders differ, and sorting by presentation time
+// interleaves frames from different decode positions, which breaks the
+// reference picture chain and makes a decoder report missing POCs. The FLV tag
+// timestamp is a decode timestamp, so decode order is also the order players
+// expect. Audio and video are still interleaved against one another, because
+// each track's timeline origin is pinned before the comparison.
 func (c *Client) emit(samples []mp4.Sample) error {
 	if len(samples) == 0 {
 		return nil
@@ -695,7 +839,11 @@ func (c *Client) emit(samples []mp4.Sample) error {
 		if bt != nil && bt.Timescale > 0 {
 			bts = bt.Timescale
 		}
-		return c.presentationMS(a, ats) < c.presentationMS(b, bts)
+		if a.TrackID == b.TrackID {
+			// Within a track the decode order must be preserved exactly.
+			return a.DTS < b.DTS
+		}
+		return c.decodeMS(a, ats) < c.decodeMS(b, bts)
 	})
 	for i := range ordered {
 		if err := c.writeSample(&ordered[i]); err != nil {
@@ -703,6 +851,17 @@ func (c *Client) emit(samples []mp4.Sample) error {
 		}
 	}
 	return nil
+}
+
+// decodeMS returns a sample's decode timestamp in milliseconds relative to its
+// track's pinned origin. It is only used to interleave tracks against each
+// other; within a track the raw decode timestamp decides the order.
+func (c *Client) decodeMS(s *mp4.Sample, timescale uint32) int64 {
+	clk := c.clocks[s.TrackID]
+	if clk == nil || !clk.hasBase {
+		return s.DTS
+	}
+	return (s.DTS-clk.base)*1000/int64(timescale) + clk.offset
 }
 
 // presentationMS returns a sample's presentation timestamp in milliseconds

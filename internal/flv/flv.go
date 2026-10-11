@@ -177,6 +177,10 @@ func (w *Writer) WriteHeader() error {
 // BytesWritten reports how many bytes have been emitted after the file header.
 func (w *Writer) BytesWritten() int64 { return w.bytesWritten }
 
+// Output returns the destination the writer emits to, so a caller that needs to
+// batch tags can write them elsewhere first.
+func (w *Writer) Output() io.Writer { return w.w }
+
 // writeTag emits one FLV tag with the given type, timestamp and payload.
 func (w *Writer) writeTag(typ byte, timestamp int64, payload []byte) error {
 	if timestamp < 0 || timestamp > MaxTimestamp {
