@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -93,9 +94,37 @@ func summariseFLV(t *testing.T, data []byte) flvSummary {
 	return s
 }
 
+// checkPlaylistReachable reports whether the playlist can be fetched. Live
+// example URLs expire, and a stale one should skip the test rather than fail
+// it, so the result is reported distinctly from a conversion failure.
+func checkPlaylistReachable(t *testing.T, url string) bool {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("building a request for %s: %v", url, err)
+	}
+	req.Header.Set("User-Agent", DefaultUserAgent)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Logf("playlist %s is unreachable: %v", url, err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Logf("playlist %s returned %s", url, resp.Status)
+		return false
+	}
+	return true
+}
+
 // runLive converts a playlist for the given duration and returns the FLV bytes.
 func runLive(t *testing.T, url string, d time.Duration) []byte {
 	t.Helper()
+	if !checkPlaylistReachable(t, url) {
+		t.Skip("the example stream is no longer available; update the URL or unset the environment variable")
+	}
 	var buf bytes.Buffer
 	c, err := New(url, &buf, Options{
 		StartFromLive: true,

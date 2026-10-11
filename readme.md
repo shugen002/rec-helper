@@ -1,10 +1,32 @@
 # hls to flv 协议转换器
 
-这是一个将 HLS 流转换为 FLV 流的工具。
+这是一个将 HLS 流转换为 FLV 流的工具，同时把其余请求原样反向代理到可配置的上游。
 
 不依赖ffmpeg，完全使用 Go 语言实现。
 
-当用户请求 http://127.0.0.1:8080/http://example.com/stream.m3u8 时，工具会将指定的 HLS 流转换为 FLV 流并返回。
+当用户请求 `http://127.0.0.1:8080/index.flv?url=<urlencode 后的 m3u8 地址>` 时，
+工具会将指定的 HLS 流转换为 FLV 流并返回。
+
+## 路由规则
+
+只有**同时满足**下面两条的请求才会被当成 FLV 转换：
+
+1. 路径**恰好**是 `/index.flv`
+2. 带有 `url`（或 `u`、`src`）参数，且其值是可用的 `http`/`https` 地址
+
+其余所有请求一律**原样转发**到 `-proxy-target`（默认
+`https://api.live.bilibili.com`），方法、路径、查询串、请求头、请求体都不改动。
+
+这样区分是必要的：像 `/room/v1/Room/get_info?url=...` 这种接口本身也可能带
+`url` 参数，如果只看参数名就会被误吞。
+
+| 请求 | 行为 |
+| --- | --- |
+| `/index.flv?url=https%3A%2F%2F...%2Fa.m3u8` | 转成 FLV 流返回 |
+| `/index.flv`（不带任何查询串，GET） | 返回用法说明 |
+| `/index.flv?url=file%3A%2F%2F%2Fetc%2Fpasswd` | 目标非法，按普通请求转发 |
+| `/room/v1/Room/get_info?room_id=1` | 转发到上游 |
+| `/room/v1/Room/get_info?room_id=1&url=...` | 转发到上游，`url` 参数原样保留 |
 
 ## 运行
 
@@ -13,9 +35,7 @@ go build -o blrechelper .
 ./blrechelper -addr 127.0.0.1:8080
 ```
 
-有两种请求写法，任选其一。
-
-### 推荐：查询参数写法
+### 取 FLV 流
 
 ```
 http://127.0.0.1:8080/index.flv?url=<urlencode 后的 m3u8 地址>
@@ -27,8 +47,7 @@ http://127.0.0.1:8080/index.flv?url=<urlencode 后的 m3u8 地址>
 http://127.0.0.1:8080/index.flv?url=https%3A%2F%2Fexample.com%2Fstream.m3u8
 ```
 
-上游地址经过百分号编码，因此**它自身带查询串时也能原样保留**，这是该写法
-最大的好处：
+上游地址经过百分号编码，因此**它自身带查询串时也能原样保留**：
 
 ```
 http://127.0.0.1:8080/index.flv?url=https%3A%2F%2Fexample.com%2Flive.m3u8%3Ftoken%3Dabc%26sign%3Ddeadbeef
@@ -49,33 +68,30 @@ $u = [uri]::EscapeDataString($M3U8)
 curl.exe -s "http://127.0.0.1:8080/index.flv?url=$u" -o out.flv
 ```
 
-### 兼容：路径写法
-
-```
-http://127.0.0.1:8080/https://example.com/stream.m3u8
-```
-
-上游 URL 就是去掉首个 `/` 之后的完整地址。部分客户端会把 `//` 折叠成 `/`，
-因此下面这种写法也支持：
-
-```
-http://127.0.0.1:8080/https:/example.com/stream.m3u8
-```
-
-注意路径写法在上游 URL 自带 `?`/`&` 时并不可靠（这些字符会被当成网关请求
-自己的查询串），这种场景请用查询参数写法。
-
 ### 播放
 
 ```
 ffplay "http://127.0.0.1:8080/index.flv?url=https%3A%2F%2Fexample.com%2Fstream.m3u8"
 ```
 
+### 转发其它请求
+
+```
+curl "http://127.0.0.1:8080/room/v1/Room/get_info?room_id=1"
+```
+
+等价于直接请求 `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=1`。
+
+转发时会附带 `X-Forwarded-For` / `X-Forwarded-Host` / `X-Forwarded-Proto`。
+如果调用方带的 `Referer`/`Origin` 指向网关自己，会被去掉，避免把网关地址
+泄露给上游。
+
 ## 参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-addr` | `127.0.0.1:8080` | 监听地址 |
+| `-proxy-target` | `https://api.live.bilibili.com` | 非 FLV 请求转发到的上游根地址；留空则关闭转发（返回 404） |
 | `-user-agent` | 内置浏览器 UA | 请求上游时使用的 `User-Agent` |
 | `-referer` | 上游根地址 | 请求上游时使用的 `Referer` |
 | `-request-timeout` | `20s` | 单个上游请求的超时时间 |
@@ -86,6 +102,7 @@ ffplay "http://127.0.0.1:8080/index.flv?url=https%3A%2F%2Fexample.com%2Fstream.m
 
 | 包 | 职责 |
 | --- | --- |
+| `main.go` | HTTP 服务：路由（FLV 转换 vs 反向代理）、转发逻辑 |
 | `internal/m3u8` | 解析 HLS 播放列表（`EXTINF`、`EXT-X-MAP`、`EXT-X-BYTERANGE`、`EXT-X-KEY`、`EXT-X-MEDIA-SEQUENCE`、主列表变体等） |
 | `internal/mp4` | 解析 fMP4/CMAF 分片：`moov` 初始化段与 `moof`/`trun`/`mdat` 媒体段 |
 | `internal/flv` | 生成 FLV：文件头、AVC/HEVC 视频标签、AAC 音频标签、AMF0 `onMetaData` |

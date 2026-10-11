@@ -1,19 +1,17 @@
 // Command blrechelper converts an HLS stream to FLV over HTTP without invoking
-// ffmpeg or any other external program.
+// ffmpeg or any other external program, and transparently reverse proxies
+// everything else to a configurable upstream.
 //
 // Usage:
 //
 //	blrechelper -addr 127.0.0.1:8080
 //
-// Then request:
+// An FLV stream is requested with the query form:
 //
-//	http://127.0.0.1:8080/http://example.com/stream.m3u8
+//	http://127.0.0.1:8080/index.flv?url=<urlencoded http://example.com/stream.m3u8>
 //
-// The HLS URL is the request path after the leading slash, so the scheme's own
-// slashes are preserved. A common shorthand is also accepted where the client
-// collapses the double slash to a single one:
-//
-//	http://127.0.0.1:8080/http:/example.com/stream.m3u8
+// Any request that is not an FLV request for /index.flv is forwarded unchanged
+// to the upstream, which defaults to https://api.live.bilibili.com.
 package main
 
 import (
@@ -24,6 +22,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
@@ -35,33 +34,51 @@ import (
 	"github.com/shugen002/blrechelper/internal/hlsflv"
 )
 
+// defaultProxyTarget is the upstream that non FLV requests are forwarded to.
+const defaultProxyTarget = "https://api.live.bilibili.com"
+
 func main() {
 	var (
-		addr     = flag.String("addr", "127.0.0.1:8080", "address to listen on")
-		referer  = flag.String("referer", "", "Referer header sent to the origin; defaults to the origin root")
-		ua       = flag.String("user-agent", hlsflv.DefaultUserAgent, "User-Agent header sent to the origin")
-		timeout  = flag.Duration("request-timeout", 20*time.Second, "timeout for a single upstream request")
-		liveOnly = flag.Bool("live", false, "skip the buffered backlog of a live playlist and start near the live edge")
-		verbose  = flag.Bool("v", false, "log per segment progress to stderr")
+		addr        = flag.String("addr", "127.0.0.1:8080", "address to listen on")
+		proxyTarget = flag.String("proxy-target", defaultProxyTarget, "base URL that non FLV requests are reverse proxied to; the request path and query are appended unchanged, use an empty value to disable proxying")
+		referer     = flag.String("referer", "", "Referer header sent to the origin; defaults to the origin root")
+		ua          = flag.String("user-agent", hlsflv.DefaultUserAgent, "User-Agent header sent to the origin")
+		timeout     = flag.Duration("request-timeout", 20*time.Second, "timeout for a single upstream request")
+		liveOnly    = flag.Bool("live", false, "skip the buffered backlog of a live playlist and start near the live edge")
+		verbose     = flag.Bool("v", false, "log per segment progress to stderr")
 	)
 	flag.Usage = usage
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "", log.LstdFlags)
+	verboseLog := func(format string, args ...any) {
+		if *verbose {
+			logger.Printf(format, args...)
+		}
+	}
+
+	proxy, err := newReverseProxy(*proxyTarget)
+	if err != nil {
+		logger.Fatalf("proxy target %q: %v", *proxyTarget, err)
+	}
+	if proxy != nil {
+		// Route proxy errors through the same logger.
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.Printf("proxy %s: %v", r.URL.Path, err)
+			http.Error(w, "upstream request failed", http.StatusBadGateway)
+		}
+	}
 
 	srv := &http.Server{
 		Addr: *addr,
 		Handler: &handler{
+			proxy: proxy,
 			opts: hlsflv.Options{
 				UserAgent:      *ua,
 				Referer:        *referer,
 				RequestTimeout: *timeout,
 				StartFromLive:  *liveOnly,
-				Logger: func(format string, args ...any) {
-					if *verbose {
-						logger.Printf(format, args...)
-					}
-				},
+				Logger:         verboseLog,
 			},
 		},
 		// No write timeout: an FLV response stays open for the whole session.
@@ -74,8 +91,12 @@ func main() {
 		logger.Fatalf("listen %s: %v", *addr, err)
 	}
 	logger.Printf("blrechelper listening on http://%s/ (go %s)", ln.Addr(), runtime.Version())
-	logger.Printf("request an FLV stream with http://%s/http://host/path/index.m3u8", ln.Addr())
-	logger.Printf("Or use the query parameter form: http://%s/index.flv?url=${urlencode(http://host/path/index.m3u8)}", ln.Addr())
+	logger.Printf("FLV stream:  http://%s/index.flv?url=<urlencoded playlist URL>", ln.Addr())
+	if proxy != nil {
+		logger.Printf("everything else is proxied to %s", strings.TrimSuffix(*proxyTarget, "/"))
+	} else {
+		logger.Printf("proxying is disabled; unmatched requests return 404")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -98,56 +119,168 @@ func main() {
 	}
 }
 
+// newReverseProxy builds the reverse proxy for non FLV requests. An empty
+// target disables proxying.
+func newReverseProxy(target string) (*httputil.ReverseProxy, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return nil, fmt.Errorf("malformed URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme %q: only http and https are allowed", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, errors.New("no host")
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			// SetURL rewrites the scheme, host and the base path, and joins
+			// the incoming path onto the target path while keeping the raw
+			// query string byte for byte.
+			r.SetURL(u)
+			r.Out.Host = u.Host
+
+			// Pass the caller's address on to the upstream.
+			r.SetXForwarded()
+
+			// A request to this gateway is not a request from a browser
+			// sitting on the origin, so drop a Referer and Origin that point
+			// back at us rather than leaking the gateway's own address.
+			if sameOrigin(r.Out.Header.Get("Referer"), r.In.Host) {
+				r.Out.Header.Del("Referer")
+			}
+			if sameOrigin(r.Out.Header.Get("Origin"), r.In.Host) {
+				r.Out.Header.Del("Origin")
+			}
+		},
+		Transport: newUpstreamTransport(),
+	}
+	return proxy, nil
+}
+
+// sameOrigin reports whether a Referer or Origin value points at host.
+func sameOrigin(value, host string) bool {
+	if value == "" {
+		return false
+	}
+	u, err := url.Parse(value)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, host)
+}
+
+// newUpstreamTransport builds the transport shared by proxying and by the HLS
+// fetches. ResponseHeaderTimeout bounds a stalled upstream without capping the
+// lifetime of a long lived response body, which an FLV stream needs.
+func newUpstreamTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `blrechelper - HLS to FLV gateway
 
 Usage:
   %s [flags]
 
-Then request:
-  http://<addr>/<hls playlist url>
+FLV stream:
+  http://<addr>/index.flv?url=<urlencoded HLS playlist URL>
+
+Everything else is reverse proxied unchanged to -proxy-target
+(default %s).
 
 Flags:
-`, os.Args[0])
+`, os.Args[0], defaultProxyTarget)
 	flag.PrintDefaults()
 }
 
-// handler serves FLV conversions.
+// handler serves FLV conversions and proxies every other request.
 type handler struct {
 	opts hlsflv.Options
+	// proxy forwards requests that are not FLV requests. Nil disables it.
+	proxy *httputil.ReverseProxy
 }
 
-// indexPath and indexFile are the endpoints that serve usage rather than a
-// stream, so a bare visit is not mistaken for a malformed target.
-const (
-	indexPath = "/"
-	indexFile = "/index.flv"
-)
+// flvPath is the endpoint that converts an HLS playlist to FLV. It is only a
+// conversion request when it also carries a target parameter, so a bare visit
+// and a proxied request for the same path are not mistaken for one another.
+const flvPath = "/index.flv"
 
 // urlQueryKeys are the query parameter names accepted as the upstream playlist
 // URL. The first one that is present wins.
 var urlQueryKeys = []string{"url", "u", "src"}
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Only an FLV request is handled here. Everything else, including a
+	// proxied request whose own query string happens to contain "url", is
+	// forwarded untouched.
+	if target, ok := flvTarget(r); ok {
+		h.serveFLV(w, r, target)
+		return
+	}
+	// A browser opening the endpoint directly gets help rather than a proxied
+	// upstream response.
+	if r.Method == http.MethodGet && r.URL.Path == flvPath && r.URL.RawQuery == "" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, usageText())
+		return
+	}
+	h.serveProxy(w, r)
+}
+
+// flvTarget reports whether the request asks for an FLV conversion and returns
+// the upstream playlist URL. The path must match exactly, so a proxied request
+// for another endpoint cannot be captured just because it has a url parameter.
+func flvTarget(r *http.Request) (string, bool) {
+	if r.URL.Path != flvPath {
+		return "", false
+	}
+	q := r.URL.Query()
+	for _, key := range urlQueryKeys {
+		v := strings.TrimSpace(q.Get(key))
+		if v == "" {
+			continue
+		}
+		u, err := url.Parse(v)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return v, false
+		}
+		return u.String(), true
+	}
+	return "", false
+}
+
+// serveProxy forwards a request unchanged to the configured upstream.
+func (h *handler) serveProxy(w http.ResponseWriter, r *http.Request) {
+	if h.proxy == nil {
+		http.NotFound(w, r)
+		return
+	}
+	h.proxy.ServeHTTP(w, r)
+}
+
+func (h *handler) serveFLV(w http.ResponseWriter, r *http.Request, target string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	path := r.URL.Path
-	if path == indexPath || path == indexFile {
-		// The query form uses this path, so only show usage when no target was
-		// supplied at all.
-		if _, ok := queryTarget(r); !ok {
-			h.index(w)
-			return
-		}
-	}
-
-	target, err := targetURL(r)
-	if err != nil {
-		http.Error(w, err.Error()+"\n\n"+usageText(), http.StatusBadRequest)
 		return
 	}
 
@@ -188,102 +321,22 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		float64(stats.Bytes)/(1<<20), err)
 }
 
-// usageText is the human readable help shown on the index page and on a bad
-// request.
+// usageText is the human readable help shown when the FLV endpoint is opened
+// directly.
 func usageText() string {
 	return `blrechelper - HLS to FLV gateway
 
-Request an FLV stream in either of these forms:
+Get an FLV stream with the query form, where the playlist URL is percent
+encoded so that any query string it carries survives intact:
 
   http://127.0.0.1:8080/index.flv?url=<urlencoded HLS playlist URL>
 
-  http://127.0.0.1:8080/<HLS playlist URL>
+For example:
 
-The query form is the safer one: the playlist URL is percent encoded, so any
-query string it carries survives intact.
+  http://127.0.0.1:8080/index.flv?url=https%3A%2F%2Fexample.com%2Fstream.m3u8
 
-An http:/example.com/stream.m3u8 form (single slash) is also accepted, which
-covers clients that collapse the double slash.
+Any other request is reverse proxied unchanged to the configured upstream.
 `
-}
-
-func (h *handler) index(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, usageText())
-}
-
-// queryTarget returns the upstream URL carried in the query string.
-//
-// It is also the hook that distinguishes a request for the usage page from a
-// request for a stream on the index path.
-func queryTarget(r *http.Request) (string, bool) {
-	q := r.URL.Query()
-	for _, key := range urlQueryKeys {
-		if v := strings.TrimSpace(q.Get(key)); v != "" {
-			return v, true
-		}
-	}
-	return "", false
-}
-
-// targetURL extracts the upstream HLS URL from the request.
-//
-// The query form is preferred:
-//
-//	/index.flv?url=https%3A%2F%2Fexample.com%2Fstream.m3u8%3Ftoken%3Dabc
-//
-// The path form is kept for compatibility and accepts both the plain form and
-// the single slash form that clients which collapse "//" produce:
-//
-//	/https://example.com/x.m3u8
-//	/https:/example.com/x.m3u8
-func targetURL(r *http.Request) (string, error) {
-	if target, ok := queryTarget(r); ok {
-		u, err := url.Parse(target)
-		if err != nil {
-			return "", fmt.Errorf("malformed upstream URL: %w", err)
-		}
-		if err := checkUpstreamURL(u); err != nil {
-			return "", err
-		}
-		return u.String(), nil
-	}
-
-	raw := r.URL.EscapedPath()
-	decoded, err := url.PathUnescape(raw)
-	if err != nil {
-		return "", fmt.Errorf("malformed request path: %w", err)
-	}
-	decoded = strings.TrimPrefix(decoded, "/")
-	if decoded == "" {
-		return "", errors.New("missing HLS playlist URL: pass it as ?url=<encoded URL>")
-	}
-
-	// Restore the authority separator when it was collapsed. A scheme is
-	// always followed by "//", so a bare "scheme:/" must become "scheme://".
-	if i := strings.Index(decoded, ":/"); i > 0 && !strings.HasPrefix(decoded[i:], "://") {
-		decoded = decoded[:i+1] + "/" + decoded[i+1:]
-	}
-
-	u, err := url.Parse(decoded)
-	if err != nil {
-		return "", fmt.Errorf("malformed upstream URL %q: %w", decoded, err)
-	}
-	if err := checkUpstreamURL(u); err != nil {
-		return "", err
-	}
-	return u.String(), nil
-}
-
-// checkUpstreamURL rejects anything that must not be fetched.
-func checkUpstreamURL(u *url.URL) error {
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %q: only http and https are allowed", u.Scheme)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("upstream URL %q has no host", u.Redacted())
-	}
-	return nil
 }
 
 // flushWriter forwards writes to the response and flushes them immediately.
