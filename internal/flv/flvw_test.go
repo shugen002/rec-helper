@@ -198,8 +198,8 @@ func TestWriteMetadataKeyThenTypeOrder(t *testing.T) {
 func TestWriteMetadataBooleanAndString(t *testing.T) {
 	m := newMetaBuilder()
 	m.boolean("stereo", true)
-	m.text("encoder", "blrechelper")
-	assertMetadata(t, Metadata{Stereo: true, Encoder: "blrechelper"}, m.done())
+	m.text("encoder", "rec-helper")
+	assertMetadata(t, Metadata{Stereo: true, Encoder: "rec-helper"}, m.done())
 }
 
 func TestWriteMetadataFull(t *testing.T) {
@@ -213,7 +213,7 @@ func TestWriteMetadataFull(t *testing.T) {
 	m.number("audiochannels", 2)
 	m.number("audiocodecid", SoundAAC)
 	m.boolean("stereo", true)
-	m.text("encoder", "blrechelper")
+	m.text("encoder", "rec-helper")
 	assertMetadata(t, Metadata{
 		Width:           1920,
 		Height:          1080,
@@ -224,7 +224,7 @@ func TestWriteMetadataFull(t *testing.T) {
 		AudioChannels:   2,
 		AudioCodecID:    SoundAAC,
 		Stereo:          true,
-		Encoder:         "blrechelper",
+		Encoder:         "rec-helper",
 	}, m.done())
 }
 
@@ -233,16 +233,16 @@ func TestWriteMetadataFull(t *testing.T) {
 func TestWriteMetadataOmitsDurationForLiveStream(t *testing.T) {
 	m := newMetaBuilder()
 	m.boolean("stereo", true)
-	m.text("encoder", "blrechelper")
-	assertMetadata(t, Metadata{Stereo: true, Encoder: "blrechelper"}, m.done())
+	m.text("encoder", "rec-helper")
+	assertMetadata(t, Metadata{Stereo: true, Encoder: "rec-helper"}, m.done())
 }
 
 func TestWriteMetadataIncludesDurationWhenKnown(t *testing.T) {
 	m := newMetaBuilder()
 	m.number("duration", 12.5)
 	m.boolean("stereo", true)
-	m.text("encoder", "blrechelper")
-	assertMetadata(t, Metadata{Duration: 12.5, Stereo: true, Encoder: "blrechelper"}, m.done())
+	m.text("encoder", "rec-helper")
+	assertMetadata(t, Metadata{Duration: 12.5, Stereo: true, Encoder: "rec-helper"}, m.done())
 }
 
 func TestWriteMetadataExtrasAreSortedByName(t *testing.T) {
@@ -252,10 +252,10 @@ func TestWriteMetadataExtrasAreSortedByName(t *testing.T) {
 	m.boolean("stereo", true)
 	m.number("audiodatarate", 128)
 	m.number("videodatarate", 3000)
-	m.text("encoder", "blrechelper")
+	m.text("encoder", "rec-helper")
 	assertMetadata(t, Metadata{
 		Stereo:  true,
-		Encoder: "blrechelper",
+		Encoder: "rec-helper",
 		Extra:   map[string]float64{"videodatarate": 3000, "audiodatarate": 128},
 	}, m.done())
 }

@@ -22,9 +22,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shugen002/blrechelper/internal/flv"
-	"github.com/shugen002/blrechelper/internal/m3u8"
-	"github.com/shugen002/blrechelper/internal/mp4"
+	"github.com/shugen002/rec-helper/internal/flv"
+	"github.com/shugen002/rec-helper/internal/m3u8"
+	"github.com/shugen002/rec-helper/internal/mp4"
 )
 
 // DefaultUserAgent is used when Options.UserAgent is empty.
@@ -854,7 +854,7 @@ func (c *Client) writeMetadata(seg m3u8.MediaSegment) error {
 	if c.video == nil && c.audio == nil {
 		return nil
 	}
-	md := flv.Metadata{Encoder: "blrechelper"}
+	md := flv.Metadata{Encoder: "rec-helper"}
 	if c.video != nil {
 		md.Width = int(c.video.Width)
 		md.Height = int(c.video.Height)
@@ -947,6 +947,25 @@ func (c *Client) writeSequenceHeaders() error {
 // timestamp is a decode timestamp, so decode order is also the order players
 // expect. Audio and video are still interleaved against one another, because
 // each track's timeline origin is pinned before the comparison.
+// emit writes one segment's samples in the order the parser produced them.
+//
+// No reordering happens, and none is needed:
+//
+//   - The parser walks the segment's moof boxes in file order, and the samples
+//     of a trun are already in decode order, which is the order an FLV tag
+//     sequence must use because its timestamp field is a decode timestamp.
+//   - FLV does not require audio and video to be interleaved. A segment arrives
+//     chunked per track, which players buffer through.
+//
+// Reordering was tried and removed: sorting by presentation timestamp
+// interleaves frames from different decode positions, which breaks the
+// reference picture chain of a B frame stream and makes decoders report missing
+// POCs. Ordering by decode timestamp is merely redundant, so the simplest
+// correct thing is to preserve what the parser produced.
+//
+// The decode timestamps of each track are checked to be non decreasing, so a
+// parser regression is reported instead of being written out as a corrupt
+// stream.
 func (c *Client) emit(samples []mp4.Sample) error {
 	if len(samples) == 0 {
 		return nil
@@ -959,51 +978,22 @@ func (c *Client) emit(samples []mp4.Sample) error {
 		c.clockFor(samples[i].TrackID, tr.Timescale).setBase(samples[i].DTS)
 	}
 
-	ordered := make([]mp4.Sample, len(samples))
-	copy(ordered, samples)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		a, b := &ordered[i], &ordered[j]
-		at, bt := c.info.TrackByID(a.TrackID), c.info.TrackByID(b.TrackID)
-		ats, bts := uint32(1), uint32(1)
-		if at != nil && at.Timescale > 0 {
-			ats = at.Timescale
+	lastDTS := make(map[uint32]int64, 2)
+	seen := make(map[uint32]bool, 2)
+	for i := range samples {
+		s := &samples[i]
+		if seen[s.TrackID] && s.DTS < lastDTS[s.TrackID] {
+			return fmt.Errorf(
+				"hlsflv: track %d decode timestamps go backwards: %d then %d",
+				s.TrackID, lastDTS[s.TrackID], s.DTS)
 		}
-		if bt != nil && bt.Timescale > 0 {
-			bts = bt.Timescale
-		}
-		if a.TrackID == b.TrackID {
-			// Within a track the decode order must be preserved exactly.
-			return a.DTS < b.DTS
-		}
-		return c.decodeMS(a, ats) < c.decodeMS(b, bts)
-	})
-	for i := range ordered {
-		if err := c.writeSample(&ordered[i]); err != nil {
+		seen[s.TrackID] = true
+		lastDTS[s.TrackID] = s.DTS
+		if err := c.writeSample(s); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// decodeMS returns a sample's decode timestamp in milliseconds relative to its
-// track's pinned origin. It is only used to interleave tracks against each
-// other; within a track the raw decode timestamp decides the order.
-func (c *Client) decodeMS(s *mp4.Sample, timescale uint32) int64 {
-	clk := c.clocks[s.TrackID]
-	if clk == nil || !clk.hasBase {
-		return s.DTS
-	}
-	return (s.DTS-clk.base)*1000/int64(timescale) + clk.offset
-}
-
-// presentationMS returns a sample's presentation timestamp in milliseconds
-// relative to its track's pinned origin.
-func (c *Client) presentationMS(s *mp4.Sample, timescale uint32) int64 {
-	clk := c.clocks[s.TrackID]
-	if clk == nil || !clk.hasBase {
-		return s.DTS + s.CTS
-	}
-	return (s.DTS+s.CTS-clk.base)*1000/int64(timescale) + clk.offset
 }
 
 // clockFor returns the clock for a track, creating it when necessary.

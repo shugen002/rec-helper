@@ -32,8 +32,8 @@
 ## 运行
 
 ```
-go build -o blrechelper .
-./blrechelper -addr 127.0.0.1:8080
+go build -o rec-helper .
+./rec-helper -addr 127.0.0.1:8080
 ```
 
 ### 取 FLV 流
@@ -159,12 +159,12 @@ X-Session-Id: bc3ec84d
 
 一次转换记四行，无论是否加了 `-v`：
 
-* `flv request from <调用方 IP>: url=<m3u8 地址>`，并列出这次请求覆盖了哪些头
+- `flv request from <调用方 IP>: url=<m3u8 地址>`，并列出这次请求覆盖了哪些头
   （只记名字，**不记值**，因为 `Cookie`/`Authorization` 里是凭据）。
-* `fetching playlist` —— 实际开始拉取的地址；主列表会额外记一行
+- `fetching playlist` —— 实际开始拉取的地址；主列表会额外记一行
   `selected variant`，因为此时分片来源和请求地址不同。
-* `stream info` —— 解码器配置就绪后输出，即编解码器、分辨率、帧率、采样率。
-* `stream ended` —— 汇总耗时、分片数、标签数、字节数，以及 `reason`：
+- `stream info` —— 解码器配置就绪后输出，即编解码器、分辨率、帧率、采样率。
+- `stream ended` —— 汇总耗时、分片数、标签数、字节数，以及 `reason`：
   `end of stream`（播放列表播完）、`cancelled`、`deadline exceeded`、
   `client disconnected`（播放器停止拉流）、或 `error: ...`。
 
@@ -201,6 +201,18 @@ X-Session-Id: bc3ec84d
 | `internal/mp4`    | 解析 fMP4/CMAF 分片：`moov` 初始化段与 `moof`/`trun`/`mdat` 媒体段                                               |
 | `internal/flv`    | 生成 FLV：文件头、AVC/HEVC 视频标签、AAC 音频标签、AMF0 `onMetaData`                                             |
 | `internal/hlsflv` | 串联整个流程：拉取播放列表、下载分片、重封装、直播列表重载                                                       |
+
+### 关于顺序
+
+分片严格按 m3u8 给出的顺序处理；分片内样本严格按解析器（即 `moof`/`trun`）给出的
+顺序写出，**不做任何重排**。这个顺序天然正确：`trun` 里样本本就是解码顺序，而 FLV
+标签的时间戳字段是 **DTS**，解码顺序正是播放器期望的顺序。FLV 也不要求音视频
+交织，分片天然按轨分块，播放器的缓冲足以吸收。
+
+这里曾经有一层按 PTS 的重排，那是个 bug：B 帧流的呈现顺序与解码顺序不同，按 PTS
+排序会把不同解码位置的帧交错，破坏参考帧链，解码器随即刷
+`co located POCs unavailable` / `mmco: unref short failure`。`emit` 现在只校验每个
+track 的 DTS 非递减，一旦解析器被改坏就报错，而不是把坏流写出去。
 
 支持的编码：
 

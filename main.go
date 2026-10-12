@@ -1,10 +1,10 @@
-// Command blrechelper converts an HLS stream to FLV over HTTP without invoking
+// Command rec-helper converts an HLS stream to FLV over HTTP without invoking
 // ffmpeg or any other external program, and transparently reverse proxies
 // everything else to a configurable upstream.
 //
 // Usage:
 //
-//	blrechelper -addr 127.0.0.1:8080
+//	rec-helper -addr 127.0.0.1:8080
 //
 // An FLV stream is requested with the query form:
 //
@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shugen002/blrechelper/internal/hlsflv"
+	"github.com/shugen002/rec-helper/internal/hlsflv"
 )
 
 // defaultProxyTarget is the upstream that non FLV requests are forwarded to.
@@ -95,7 +95,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("listen %s: %v", *addr, err)
 	}
-	logger.Printf("blrechelper listening on http://%s/ (go %s)", ln.Addr(), runtime.Version())
+	logger.Printf("rec-helper listening on http://%s/ (go %s)", ln.Addr(), runtime.Version())
 	logger.Printf("FLV stream:  http://%s/index.flv?url=<urlencoded playlist URL>", ln.Addr())
 	if proxy != nil {
 		logger.Printf("everything else is proxied to %s", strings.TrimSuffix(*proxyTarget, "/"))
@@ -201,7 +201,7 @@ func newUpstreamTransport() *http.Transport {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `blrechelper - HLS to FLV gateway
+	fmt.Fprintf(os.Stderr, `rec-helper - HLS to FLV gateway
 
 Usage:
   %s [flags]
@@ -516,7 +516,7 @@ func describeOverrideHeaders(headers []hlsflv.RequestHeader) string {
 // usageText is the human readable help shown when the FLV endpoint is opened
 // directly.
 func usageText() string {
-	return `blrechelper - HLS to FLV gateway
+	return `rec-helper - HLS to FLV gateway
 
 Get an FLV stream with the query form, where the playlist URL is percent
 encoded so that any query string it carries survives intact:

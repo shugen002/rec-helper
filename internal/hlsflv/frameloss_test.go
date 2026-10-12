@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shugen002/blrechelper/internal/mp4"
+	"github.com/shugen002/rec-helper/internal/mp4"
 )
 
 // countingWriter discards output but counts bytes, so a conversion can be run
