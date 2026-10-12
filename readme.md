@@ -268,3 +268,7 @@ go test ./internal/hlsflv/ -run TestLive -v
 - 加密流（`EXT-X-KEY`）会以明确的错误跳过该分片，不做解密。
 - 直播流没有时长，因此不会写入 `duration` 元数据字段；点播流也没有实现，
   因为播放列表里的总时长需要遍历全部分片。
+
+## 录播姬用户脚本
+
+在 `rec.userscript.js` 中，自行在录播姬高级设置里添加用户脚本即可。

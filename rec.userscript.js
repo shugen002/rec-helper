@@ -185,6 +185,9 @@ function parseM3U8(text) {
   return result;
 }
 
+const hackableRegex = /https:\/\/((?:ec|cn)-.{2,9}-.{2,4}-)(\d+)-(\d+)\.bilivideo\.com\/live-bvc\/(\d+)\/live_([^_]+_[^_]+_[^_]+)_.{3,8}\/([^\?]*)\?(.*)/
+const hackableReplace = "https://$1$2-$3.bilivideo.com/live-bvc/$4/live_$5/$6"
+
 function onFetchStreamUrl(data) {
   try {
     // 1. 请求 B 站 master m3u8 接口
@@ -203,21 +206,36 @@ function onFetchStreamUrl(data) {
     // 2. 解析 master m3u8，找出 BANDWIDTH 最大的 #EXT-X-STREAM-INF 对应的 URI
     var m3u8obj = parseM3U8(m3u8);
     var best = null;
+    var hackAble = null;
     for (var i = 0; i < m3u8obj.variants.length; i++) {
       var variant = m3u8obj.variants[i];
       if (!best || (variant.bandwidth || 0) > (best.bandwidth || 0)) {
         best = variant;
       }
+      if (hackableRegex.test(variant.uri)) {
+        hackAble = variant;
+      }
     }
+
+    var finalVar = best;
 
     if (!best || !best.uri) {
       console.error('m3u8 中未找到可用的 STREAM-INF 流地址');
       return null;
     }
 
+    var useHacked = false;
+
+    if (hackAble) {
+      finalVar = hackAble
+      finalVar.uri = finalVar.uri.replace(hackableRegex, hackableReplace);
+      useHacked = true;
+    }
+
+
     // 3. 拼成本地代理地址
-    var proxyUrl = 'http://127.0.0.1:8080/index.flv?url=' + encodeURIComponent(best.uri);
-    console.log('选用码率 ' + best.bandwidth + 'Qn' + best.biliQn);
+    var proxyUrl = 'http://127.0.0.1:8080/index.flv?url=' + encodeURIComponent(finalVar.uri);
+    console.log('选用码率 ' + finalVar.bandwidth + 'Qn' + (useHacked ? "99999" : finalVar.biliQn));
     return proxyUrl;
 
   } catch (e) {
@@ -225,3 +243,5 @@ function onFetchStreamUrl(data) {
     return null;
   }
 }
+
+recorderEvents.onFetchStreamUrl = onFetchStreamUrl;
