@@ -1,3 +1,6 @@
+// 代理服务地址
+const FLVPROXY = "http://127.0.0.1:8080/index.flv?url="
+
 // 匹配 KEY=VALUE，VALUE 可能是 "带引号,可含逗号" 或裸值
 const ATTR_RE = /([A-Za-z0-9][A-Za-z0-9-]*)=("(?:[^"\\]|\\.)*"|[^,]*)/g;
 
@@ -234,7 +237,7 @@ function onFetchStreamUrl(data) {
 
 
     // 3. 拼成本地代理地址
-    var proxyUrl = 'http://127.0.0.1:8080/index.flv?url=' + encodeURIComponent(finalVar.uri);
+    var proxyUrl = FLVPROXY + encodeURIComponent(finalVar.uri);
     console.log('选用码率 ' + finalVar.bandwidth + ' Qn ' + (useHacked ? "99999" : finalVar.biliQn));
     return proxyUrl;
 
